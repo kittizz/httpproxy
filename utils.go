@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"regexp"
@@ -131,4 +132,26 @@ func stripPort(s string) string {
 		return s
 	}
 	return s[:ix]
+}
+func GetFreePort() (port int, err error) {
+	var a *net.TCPAddr
+	if a, err = net.ResolveTCPAddr("tcp", "0.0.0.0:0"); err == nil {
+		var l *net.TCPListener
+		if l, err = net.ListenTCP("tcp", a); err == nil {
+			defer l.Close()
+			return l.Addr().(*net.TCPAddr).Port, nil
+		}
+	}
+	return
+}
+
+func CheckFreePort(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+
+	if err != nil {
+		return false
+	}
+
+	ln.Close()
+	return true
 }

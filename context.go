@@ -5,11 +5,16 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/cornelk/hashmap"
 )
 
 // Context keeps context of each proxy request.
@@ -43,9 +48,18 @@ type Context struct {
 	// User data to use free.
 	UserData interface{}
 
+	DstIP           string
+	DstPort         int
+	DstNetTimeout   time.Duration
+	DstNetKeepalive time.Duration
+
+	IsRandomSrcPort bool
+
 	hijTLSConn   *tls.Conn
 	hijTLSReader *bufio.Reader
 }
+
+var srcMap = hashmap.New[int, bool]()
 
 func (ctx *Context) onAccept(w http.ResponseWriter, r *http.Request) bool {
 	defer func() {
@@ -362,17 +376,79 @@ func (ctx *Context) doRequest(w http.ResponseWriter, r *http.Request) (bool, err
 }
 
 func (ctx *Context) doResponse(w http.ResponseWriter, r *http.Request) error {
+
 	if r.Body != nil {
 		defer r.Body.Close()
+	}
+	if ctx.DstIP != "" && ctx.DstPort != 0 {
+		ctx.Prx.Rt.(*http.Transport).DialContext = func(dialtx context.Context, network, addr string) (net.Conn, error) {
+			LocalAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", ctx.DstIP, ctx.DstPort))
+			if err != nil {
+				return nil, err
+			}
+			dialer := &net.Dialer{
+				LocalAddr: LocalAddr,
+				Timeout:   ctx.DstNetTimeout,
+				KeepAlive: ctx.DstNetKeepalive,
+			}
+			conn, err := dialer.Dial(network, addr)
+			return conn, err
+		}
+
+	}
+	if ctx.IsRandomSrcPort {
+
+		var rport int
+
+		for {
+			r := rand.New(rand.NewSource((time.Now().UnixNano())))
+			min := 0
+			max := 10
+
+			gport := r.Intn(max-min) + min
+
+			minPort := 50000 + (gport * 1000)
+			maxPort := 50000 + ((gport + 1) * 1000)
+
+			rport = r.Intn(maxPort-minPort) + minPort
+			_, exist := srcMap.Get(rport)
+			if exist {
+				continue
+			}
+			srcMap.Set(rport, true)
+
+			if CheckFreePort(rport) {
+				defer srcMap.Del(rport)
+				ctx.Prx.Rt.(*http.Transport).DialContext = func(dialtx context.Context, network, addr string) (net.Conn, error) {
+					LocalAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("0.0.0.0:%d", rport))
+					if err != nil {
+						return nil, err
+					}
+					dialer := &net.Dialer{
+						LocalAddr: LocalAddr,
+						Timeout:   time.Minute * 1,
+						KeepAlive: time.Second * 15,
+					}
+					conn, err := dialer.Dial(network, addr)
+					return conn, err
+				}
+				break
+			}
+			srcMap.Del(rport)
+			// fmt.Println("random port:", rport, "gport:", gport)
+			// fmt.Println("len:", srcMap.Len(), "FillRate:", srcMap.FillRate())
+
+		}
+
 	}
 	resp, err := ctx.Prx.Rt.RoundTrip(r)
 	if err != nil {
 		if err != context.Canceled && !isConnectionClosed(err) {
-			ctx.doError("Response", ErrRoundTrip, err)
+			ctx.doError("Response1", ErrRoundTrip, err)
 		}
 		err := ServeInMemory(w, 404, nil, nil)
 		if err != nil && !isConnectionClosed(err) {
-			ctx.doError("Response", ErrResponseWrite, err)
+			ctx.doError("Response2", ErrResponseWrite, err)
 		}
 		return err
 	}
